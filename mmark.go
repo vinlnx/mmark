@@ -39,7 +39,7 @@ var (
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "SYNOPSIS: %s [OPTIONS] %s\n", os.Args[0], "[FILE...]")
+		fmt.Fprintf(os.Stderr, "SYNOPSIS: %s [OPTIONS] %s\n", os.Args[0], "[FILE...]")
 		fmt.Println("\nOPTIONS:")
 		flag.PrintDefaults()
 	}
