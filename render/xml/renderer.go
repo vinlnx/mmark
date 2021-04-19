@@ -3,6 +3,8 @@ package xml
 import (
 	"fmt"
 	"io"
+	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -224,6 +226,22 @@ func (r *Renderer) paragraphEnter(w io.Writer, para *ast.Paragraph) {
 		if p.ListFlags&ast.ListTypeTerm != 0 {
 			return
 		}
+		if p.ListFlags&ast.ListItemContainsBlock == 0 {
+			// No block level elements, don't output a paragraph. However a list in a list
+			// doesn't show up as a block level element, so we check for that as well. In that
+			// case we do need to output a para tag.
+			listInList := false
+			ast.WalkFunc(p, func(node ast.Node, entering bool) ast.WalkStatus {
+				if _, ok := node.(*ast.List); ok {
+					listInList = true
+					return ast.Terminate
+				}
+				return ast.GoToNext
+			})
+			if !listInList {
+				return
+			}
+		}
 	}
 	if _, ok := para.Parent.(*ast.CaptionFigure); ok {
 		return
@@ -236,6 +254,20 @@ func (r *Renderer) paragraphExit(w io.Writer, para *ast.Paragraph) {
 	if p, ok := para.Parent.(*ast.ListItem); ok {
 		if p.ListFlags&ast.ListTypeTerm != 0 {
 			return
+		}
+		if p.ListFlags&ast.ListItemContainsBlock == 0 {
+			// see comments in paragraphEnter
+			listInList := false
+			ast.WalkFunc(p, func(node ast.Node, entering bool) ast.WalkStatus {
+				if _, ok := node.(*ast.List); ok {
+					listInList = true
+					return ast.Terminate
+				}
+				return ast.GoToNext
+			})
+			if !listInList {
+				return
+			}
 		}
 	}
 	if _, ok := para.Parent.(*ast.CaptionFigure); ok {
@@ -400,6 +432,11 @@ func (r *Renderer) htmlSpan(w io.Writer, span *ast.HTMLSpan) {
 	if _, ok := IsComment(span.Literal); ok {
 		return
 	}
+	if IsBr(span.Literal) {
+		r.hardBreak(w, &ast.Hardbreak{})
+		return
+	}
+
 	if r.opts.Flags&SkipHTML == 0 {
 		html.EscapeHTML(w, span.Literal)
 	}
@@ -469,12 +506,21 @@ func (r *Renderer) image(w io.Writer, node *ast.Image, entering bool) {
 func (r *Renderer) imageEnter(w io.Writer, image *ast.Image) {
 	dest := image.Destination
 	r.outs(w, `<artwork src="`)
-	// type= will be the alt text
 	html.EscapeHTML(w, dest)
-	r.outs(w, `" type="`)
+	r.outs(w, `"`)
+	ext := path.Ext(string(dest))
+	if len(ext) > 2 {
+		r.outs(w, ` type="`)
+		r.outs(w, ext[1:])
+		r.outs(w, `"`)
+	}
+
+	// alt= will be the alt text (which is normal text so rendered by the normal render flow)
+	r.outs(w, ` alt="`)
 }
 
 func (r *Renderer) imageExit(w io.Writer, image *ast.Image) {
+	// where to put image title? Put in the artwork?
 	if image.Title != nil {
 		r.outs(w, `" name="`)
 		html.EscapeHTML(w, image.Title)
@@ -502,6 +548,11 @@ func (r *Renderer) mathBlock(w io.Writer, mathBlock *ast.MathBlock) {
 func (r *Renderer) captionFigure(w io.Writer, captionFigure *ast.CaptionFigure, entering bool) {
 	// If the captionFigure has a table as child element *don't* output the figure tags, because 7991 is weird.
 	// If we have a quoted blockquote it is also wrapped in a figure, which we don't want.
+	//
+	// To detect an artset, we check the number of images, *and* if the filename referenced in Destination is equal apart from the
+	// extensions. We don't care about the extension here, but if we detect this we wrap the lot in a artset.
+	base := ""
+	artset := false
 	for _, child := range captionFigure.GetChildren() {
 		if _, ok := child.(*ast.Table); ok {
 			return
@@ -509,9 +560,28 @@ func (r *Renderer) captionFigure(w io.Writer, captionFigure *ast.CaptionFigure, 
 		if _, ok := child.(*ast.BlockQuote); ok {
 			return
 		}
+		// for figures/images, these are wrapped below a paragraph.
+		// TODO: can there be more than 1 paragraph??
+		if p, ok := child.(*ast.Paragraph); ok {
+			for _, img := range p.GetChildren() {
+				x, ok := img.(*ast.Image)
+				if !ok {
+					continue
+				}
+				b := strings.TrimSuffix(string(x.Destination), filepath.Ext(string(x.Destination)))
+				artset = false
+				if b == base {
+					artset = true
+				}
+				base = b
+			}
+		}
 	}
 
 	if !entering {
+		if artset {
+			r.outs(w, "</artset>\n")
+		}
 		r.outs(w, "</figure>\n")
 		return
 	}
@@ -543,6 +613,10 @@ func (r *Renderer) captionFigure(w io.Writer, captionFigure *ast.CaptionFigure, 
 			mast.DeleteAttribute(artwork, "id")
 		}
 	}
+	if artset {
+		r.outs(w, "<artset>\n")
+	}
+
 }
 
 func (r *Renderer) table(w io.Writer, tab *ast.Table, entering bool) {
@@ -577,6 +651,12 @@ func (r *Renderer) table(w io.Writer, tab *ast.Table, entering bool) {
 }
 
 func (r *Renderer) blockQuote(w io.Writer, block *ast.BlockQuote, entering bool) {
+	if r.section != nil && r.section.IsSpecial {
+		// XML2RFC doesn't like blocklevel elements in special section, this should be done in other
+		// places, but I'm using this in learning go and I want that to translate cleanly to txt with xml2rfc.
+		return
+	}
+
 	if !entering {
 		r.outs(w, "</blockquote>")
 		return
@@ -636,6 +716,8 @@ func (r *Renderer) RenderNode(w io.Writer, node ast.Node, entering bool) ast.Wal
 	case *mast.Title:
 		r.titleBlock(w, node)
 		r.title = true
+	case *mast.Authors:
+		// ignore
 	case *mast.Bibliography:
 		r.bibliography(w, node, entering)
 	case *mast.BibliographyItem:
